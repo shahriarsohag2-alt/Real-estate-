@@ -1,0 +1,6 @@
+/assets/scrub/*
+  Cache-Control: public, max-age=31536000, immutable
+  Accept-Ranges: bytes
+
+/assets/aistudio/*
+  Cache-Control: public, max-age=31536000, immutable
