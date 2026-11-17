@@ -747,6 +747,8 @@
         var isMobile = matchMedia("(max-width: 768px), (pointer: coarse)").matches;
         var canFetchRelative =
           location.protocol === "http:" || location.protocol === "https:";
+        var FALLBACK_BASE =
+          "https://ais-pre-a3vt5e4bgrnsz7suiaz74f-479177360610.asia-southeast1.run.app";
 
         var clamp = function (v) {
           return v < 0 ? 0 : v > 1 ? 1 : v;
@@ -776,32 +778,77 @@
 
         var videos = {};
         var loaded = {};
+        var triedFallback = {};
         var videoReady = {};
         var videoFailed = {};
         var time = {};
+        var desiredTime = {};
         var clipMap = {};
         CLIPS.forEach(function (c) {
           clipMap[c.file] = c;
         });
 
+        var prefetchIdx = 2;
+        var prefetchTimer = 0;
+        function pumpPrefetchQueue() {
+          clearTimeout(prefetchTimer);
+          while (prefetchIdx < CLIPS.length) {
+            var nextClip = CLIPS[prefetchIdx];
+            prefetchIdx++;
+            if (!loaded[nextClip.file] && !videoFailed[nextClip.file]) {
+              fetchFile(nextClip.file);
+              prefetchTimer = setTimeout(pumpPrefetchQueue, 2400);
+              return;
+            }
+          }
+        }
+
         document.querySelectorAll(".film video").forEach(function (v) {
           var file = v.dataset.file;
           videos[file] = v;
-          v.addEventListener("loadeddata", function () {
-            videoReady[file] = true;
-          });
-          v.addEventListener("canplay", function () {
-            videoReady[file] = true;
+          function onReady() {
+            if (v.readyState >= 2) {
+              videoReady[file] = true;
+            }
+            if (prefetchIdx < CLIPS.length) {
+              var lastQueued = CLIPS[Math.max(0, prefetchIdx - 1)];
+              if (file === lastQueued.file || file === CLIPS[0].file || file === CLIPS[1].file) {
+                pumpPrefetchQueue();
+              }
+            }
+          }
+          v.addEventListener("loadeddata", onReady);
+          v.addEventListener("canplay", onReady);
+          v.addEventListener("seeked", function () {
+            var want = desiredTime[file];
+            if (typeof want === "number" && Number.isFinite(v.duration) && v.duration > 0) {
+              var maxT = Math.max(0, v.duration - 0.02);
+              var target = Math.min(Math.max(0, want), maxT);
+              if (!v.seeking && Math.abs(target - v.currentTime) > 0.022) {
+                time[file] = target;
+                v.currentTime = target;
+              }
+            }
           });
           v.addEventListener("error", function () {
+            var clip = clipMap[file];
+            if (clip && !triedFallback[file] && canFetchRelative && location.origin !== FALLBACK_BASE) {
+              triedFallback[file] = true;
+              var relSrc = isMobile ? clip.mobileVideoSrc : clip.videoSrc;
+              v.src = FALLBACK_BASE + "/" + relSrc;
+              v.load();
+              return;
+            }
             videoFailed[file] = true;
+            pumpPrefetchQueue();
           });
           v.addEventListener("loadedmetadata", function () {
-            var t = time[file];
+            var t = desiredTime[file] !== undefined ? desiredTime[file] : (time[file] !== undefined ? time[file] : 0);
             if (typeof t === "number" && Number.isFinite(v.duration) && v.duration > 0) {
               var maxT = Math.max(0, v.duration - 0.02);
               var clamped = Math.min(Math.max(0, t), maxT);
-              if (!v.seeking && Math.abs(clamped - v.currentTime) > 0.008) {
+              if (!v.seeking && Math.abs(clamped - v.currentTime) > 0.02) {
+                time[file] = clamped;
                 v.currentTime = clamped;
               }
             }
@@ -809,18 +856,52 @@
         });
 
         function fetchFile(file) {
-          if (!canFetchRelative || loaded[file] || videoFailed[file]) return;
+          if (loaded[file] || videoFailed[file]) return;
           var clip = clipMap[file];
           var v = videos[file];
           if (!clip || !v) return;
           loaded[file] = true;
           v.preload = "auto";
-          v.src = isMobile ? clip.mobileVideoSrc : clip.videoSrc;
+          var relSrc = isMobile ? clip.mobileVideoSrc : clip.videoSrc;
+          if (canFetchRelative) {
+            v.src = relSrc;
+          } else {
+            triedFallback[file] = true;
+            v.src = FALLBACK_BASE + "/" + relSrc;
+          }
           v.load();
         }
 
         fetchFile(CLIPS[0].file);
         fetchFile(CLIPS[1].file);
+        prefetchTimer = setTimeout(pumpPrefetchQueue, 1200);
+
+        var unlockedFiles = {};
+        var unlockedCount = 0;
+        function unlockTouchSeek() {
+          for (var i = 0; i < CLIPS.length; i++) {
+            (function (file) {
+              var v = videos[file];
+              if (v && v.src && !unlockedFiles[file]) {
+                unlockedFiles[file] = true;
+                unlockedCount++;
+                var p = v.play();
+                if (p && typeof p.then === "function") {
+                  p.then(function () {
+                    v.pause();
+                  }).catch(function () {
+                    unlockedFiles[file] = false;
+                    unlockedCount--;
+                  });
+                }
+              }
+            })(CLIPS[i].file);
+          }
+          if (unlockedCount >= CLIPS.length) {
+            removeEventListener("touchstart", unlockTouchSeek);
+          }
+        }
+        addEventListener("touchstart", unlockTouchSeek, { passive: true });
 
         var spans = [];
         var pageHeight = 0;
@@ -859,6 +940,16 @@
           }
         }
 
+        var lenis = null;
+        if (!calm && window.Lenis) {
+          lenis = new Lenis({
+            lerp: 0.085,
+            wheelMultiplier: 0.95,
+            syncTouch: false,
+            anchors: false,
+          });
+        }
+
         var bar = document.getElementById("bar");
         var last = CLIPS.length - 1;
         var prev = 0;
@@ -868,13 +959,13 @@
           prev = now;
 
           var vh = window.innerHeight || 1;
-          var scrollTop = window.scrollY;
+          var scrollTop = lenis ? lenis.scroll : window.scrollY;
           var line = scrollTop + vh * 0.5;
           var join = vh * 0.06;
           var glide = vh * 0.8;
           var fadeLen = vh * 0.7;
           var doorLen = vh * 0.48;
-          var k = 1 - Math.exp(-(dt / 1000) * 12);
+          var k = 1 - Math.exp(-(dt / 1000) * 28);
           var used = {};
 
           for (var i = 0; i <= last; i++) {
@@ -948,19 +1039,24 @@
             if (!v && !still) continue;
             used[clip.file] = true;
 
-            var useVideo = Boolean(v && videoReady[clip.file] && v.readyState >= 2 && Number.isFinite(v.duration) && v.duration > 0);
+            var useVideo = Boolean(v && !videoFailed[clip.file] && (videoReady[clip.file] || v.readyState >= 2) && Number.isFinite(v.duration) && v.duration > 0);
 
-            if (useVideo) {
+            if (v && Number.isFinite(v.duration) && v.duration > 0) {
               var maxTime = Math.max(0, v.duration - 0.02);
               var want = Math.min(paced(clip, clamp(progress)) * v.duration, maxTime);
+              desiredTime[clip.file] = want;
               var from = time[clip.file];
               var t =
-                from === undefined || Math.abs(want - from) > 1.5
+                from === undefined || Math.abs(want - from) > 1.2
                   ? want
                   : from + (want - from) * k;
-              time[clip.file] = t;
-              if (!v.seeking && Math.abs(t - v.currentTime) > 0.016) {
-                v.currentTime = t;
+              if (!v.seeking && v.readyState >= 1) {
+                time[clip.file] = t;
+                if (Math.abs(t - v.currentTime) > 0.022) {
+                  v.currentTime = t;
+                }
+              } else if (from === undefined) {
+                time[clip.file] = want;
               }
             }
 
@@ -1113,15 +1209,42 @@
           );
         }
 
-        var lenis = null;
-        if (!calm && window.Lenis) {
-          lenis = new Lenis({
-            lerp: 0.11,
-            wheelMultiplier: 1.05,
-            syncTouch: false,
-            anchors: true,
+        document.querySelectorAll('a[href^="#"]').forEach(function (anchor) {
+          anchor.addEventListener("click", function (e) {
+            var hash = anchor.getAttribute("href") || "";
+            if (!hash) return;
+            e.preventDefault();
+            if (hash === "#top") {
+              if (lenis) {
+                lenis.scrollTo(0);
+              } else {
+                window.scrollTo({ top: 0, behavior: "smooth" });
+              }
+              return;
+            }
+            var id = hash.slice(1);
+            var idx = id === "viewings-enquiry" ? last : -1;
+            if (idx < 0) {
+              for (var j = 0; j < CLIPS.length; j++) {
+                if (CLIPS[j].id === id) {
+                  idx = j;
+                  break;
+                }
+              }
+            }
+            if (idx >= 0) {
+              fetchFile(CLIPS[idx].file);
+              if (idx > 0) fetchFile(CLIPS[idx - 1].file);
+              if (idx < last) fetchFile(CLIPS[idx + 1].file);
+            }
+            if (lenis) {
+              lenis.scrollTo(hash);
+            } else {
+              var target = document.getElementById(id);
+              if (target) target.scrollIntoView({ behavior: "smooth" });
+            }
           });
-        }
+        });
 
         function loop(now) {
           if (lenis) lenis.raf(now);
@@ -1133,11 +1256,10 @@
         frame(performance.now());
         requestAnimationFrame(loop);
 
-        var resizeTimer;
-        addEventListener("resize", function () {
-          clearTimeout(resizeTimer);
-          resizeTimer = setTimeout(measure, 120);
-        });
+        if (typeof ResizeObserver === "function") {
+          new ResizeObserver(measure).observe(document.documentElement);
+        }
+        addEventListener("resize", measure, { passive: true });
         addEventListener("load", measure);
         if (document.fonts && document.fonts.ready) {
           document.fonts.ready.then(measure);

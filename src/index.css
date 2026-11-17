@@ -140,7 +140,8 @@ dd {
   pointer-events: none;
 }
 
-.film video {
+.film video,
+.film img.backdrop-still {
   position: absolute;
   inset: 0;
   width: 100%;
@@ -150,7 +151,7 @@ dd {
   visibility: hidden;
 }
 
-.film video:first-child {
+.film img.backdrop-still:first-child {
   visibility: visible;
 }
 

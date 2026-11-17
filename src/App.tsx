@@ -56,6 +56,7 @@ function put(
 }
 
 export default function App() {
+  const stillRefs = useRef<Record<string, HTMLImageElement | null>>({});
   const videoRefs = useRef<Record<string, HTMLVideoElement | null>>({});
   const chapterRefs = useRef<Record<string, HTMLElement | null>>({});
   const cueRefs = useRef<Record<string, HTMLDivElement | null>>({});
@@ -63,7 +64,11 @@ export default function App() {
   const lenisRef = useRef<Lenis | null>(null);
 
   const loadedFilesRef = useRef<Record<string, boolean>>({});
+  const videoReadyRef = useRef<Record<string, boolean>>({});
   const timeRef = useRef<Record<string, number>>({});
+  const desiredTimeRef = useRef<Record<string, number>>({});
+  const nextPrefetchIdxRef = useRef<number>(2);
+  const prefetchFallbackRef = useRef<number>(0);
   const spansRef = useRef<MeasuredSpan[]>([]);
   const pageHeightRef = useRef<number>(0);
 
@@ -161,23 +166,64 @@ export default function App() {
     v.load();
   }, []);
 
+  const pumpPrefetchQueue = useCallback(() => {
+    window.clearTimeout(prefetchFallbackRef.current);
+    while (nextPrefetchIdxRef.current < CLIPS.length) {
+      const nextClip = CLIPS[nextPrefetchIdxRef.current];
+      nextPrefetchIdxRef.current++;
+      if (!loadedFilesRef.current[nextClip.file]) {
+        fetchFile(nextClip.file);
+        prefetchFallbackRef.current = window.setTimeout(pumpPrefetchQueue, 2400);
+        return;
+      }
+    }
+  }, [fetchFile]);
+
   const handleVideoMetadata = useCallback(
     (file: string, video: HTMLVideoElement) => {
-      const t = timeRef.current[file];
-      if (
-        typeof t === "number" &&
-        Number.isFinite(video.duration) &&
-        video.duration > 0
-      ) {
+      const t = desiredTimeRef.current[file] ?? timeRef.current[file] ?? 0;
+      if (Number.isFinite(video.duration) && video.duration > 0) {
         const maxT = Math.max(0, video.duration - 0.02);
         const clampedTime = Math.min(Math.max(0, t), maxT);
-        if (!video.seeking && Math.abs(clampedTime - video.currentTime) > 0.008) {
+        if (!video.seeking && Math.abs(clampedTime - video.currentTime) > 0.02) {
+          timeRef.current[file] = clampedTime;
           video.currentTime = clampedTime;
         }
       }
     },
     []
   );
+
+  const handleVideoReady = useCallback(
+    (file: string, video: HTMLVideoElement) => {
+      if (video.readyState >= 2) {
+        videoReadyRef.current[file] = true;
+      }
+      if (!isDesktopForcedRef.current && nextPrefetchIdxRef.current < CLIPS.length) {
+        const lastQueued = CLIPS[Math.max(0, nextPrefetchIdxRef.current - 1)];
+        if (file === lastQueued.file || file === CLIPS[0].file || file === CLIPS[1].file) {
+          pumpPrefetchQueue();
+        }
+      }
+    },
+    [pumpPrefetchQueue]
+  );
+
+  const handleVideoSeeked = useCallback((file: string, video: HTMLVideoElement) => {
+    const want = desiredTimeRef.current[file];
+    if (
+      typeof want === "number" &&
+      Number.isFinite(video.duration) &&
+      video.duration > 0
+    ) {
+      const maxT = Math.max(0, video.duration - 0.02);
+      const target = Math.min(Math.max(0, want), maxT);
+      if (!video.seeking && Math.abs(target - video.currentTime) > 0.022) {
+        timeRef.current[file] = target;
+        video.currentTime = target;
+      }
+    }
+  }, []);
 
   const handleNavigate = useCallback(
     (hash: string) => {
@@ -217,23 +263,13 @@ export default function App() {
     fetchFile(CLIPS[0].file);
     fetchFile(CLIPS[1].file);
 
-    // Stagger prefetch of remaining lightweight fast-scrub clips so published-link scrolling never stalls
-    let prefetchIdx = 2;
-    let prefetchTimer = 0;
+    // Prefetch remaining clips sequentially so active clips keep full network priority on published links
     if (isDesktopForcedRef.current) {
-      while (prefetchIdx < CLIPS.length) {
-        fetchFile(CLIPS[prefetchIdx].file);
-        prefetchIdx++;
+      for (let idx = 2; idx < CLIPS.length; idx++) {
+        fetchFile(CLIPS[idx].file);
       }
     } else {
-      prefetchTimer = window.setInterval(() => {
-        if (prefetchIdx >= CLIPS.length) {
-          window.clearInterval(prefetchTimer);
-          return;
-        }
-        fetchFile(CLIPS[prefetchIdx].file);
-        prefetchIdx++;
-      }, 350);
+      prefetchFallbackRef.current = window.setTimeout(pumpPrefetchQueue, 1200);
     }
 
     const measure = () => {
@@ -279,19 +315,30 @@ export default function App() {
       }
     };
 
+    let lenis: Lenis | null = null;
+    if (!calm) {
+      lenis = new Lenis({
+        lerp: 0.085,
+        wheelMultiplier: 0.95,
+        syncTouch: false,
+        anchors: false,
+      });
+      lenisRef.current = lenis;
+    }
+
     let prev = 0;
     const frame = (now: number) => {
       const dt = prev ? Math.min(100, now - prev) : 16;
       prev = now;
 
       const vh = window.innerHeight || 1;
-      const scrollTop = window.scrollY;
+      const scrollTop = lenis ? lenis.scroll : window.scrollY;
       const line = scrollTop + vh * 0.5;
       const join = vh * 0.06;
       const glide = vh * 0.8;
       const fadeLen = vh * 0.7;
       const doorLen = vh * 0.48;
-      const k = 1 - Math.exp(-(dt / 1000) * 12);
+      const k = 1 - Math.exp(-(dt / 1000) * 28);
       const spans = spansRef.current;
       const pageHeight = pageHeightRef.current;
       const used: Record<string, boolean> = {};
@@ -348,7 +395,7 @@ export default function App() {
             ? end
             : end + join;
 
-        if (line > start - vh * 3 && line < end + vh * 3) {
+        if (line > start - vh * 2.5 && line < end + vh * 2.5) {
           fetchFile(clip.file);
         }
 
@@ -363,20 +410,33 @@ export default function App() {
         }
 
         const v = videoRefs.current[clip.file];
-        if (!v) continue;
+        const still = stillRefs.current[clip.file];
+        if (!v && !still) continue;
         used[clip.file] = true;
 
-        if (Number.isFinite(v.duration) && v.duration > 0) {
+        const hasDuration = Boolean(v && Number.isFinite(v.duration) && v.duration > 0);
+        const useVideo = Boolean(
+          v &&
+            hasDuration &&
+            (videoReadyRef.current[clip.file] || v.readyState >= 2)
+        );
+
+        if (v && hasDuration) {
           const maxTime = Math.max(0, v.duration - 0.02);
           const want = Math.min(paced(clip, clamp(progress)) * v.duration, maxTime);
+          desiredTimeRef.current[clip.file] = want;
           const from = timeRef.current[clip.file];
           const t =
-            from === undefined || Math.abs(want - from) > 1.5
+            from === undefined || Math.abs(want - from) > 1.2
               ? want
               : from + (want - from) * k;
-          timeRef.current[clip.file] = t;
-          if (!v.seeking && v.readyState >= 1 && Math.abs(t - v.currentTime) > 0.016) {
-            v.currentTime = t;
+          if (!v.seeking && v.readyState >= 1) {
+            timeRef.current[clip.file] = t;
+            if (Math.abs(t - v.currentTime) > 0.022) {
+              v.currentTime = t;
+            }
+          } else if (from === undefined) {
+            timeRef.current[clip.file] = want;
           }
         }
 
@@ -473,24 +533,41 @@ export default function App() {
           objPos = `${(50 - 46 * panT).toFixed(1)}% 50%`;
         }
 
-        put(v, "zIndex", String(i + 1));
-        put(v, "opacity", opacity.toFixed(3));
-        put(v, "visibility", "visible");
         activeChapterRef.current = clip.label;
-        put(v, "objectPosition", objPos);
-        put(v, "transformOrigin", originStr);
         const transformStr =
           txPx !== 0 || tyPx !== 0
             ? `translate3d(${txPx.toFixed(1)}px,${tyPx.toFixed(1)}px,0) scale(${panScale.toFixed(4)})`
             : panScale !== 1
             ? `translate3d(${x.toFixed(3)}%,0,0) scale(${panScale.toFixed(4)})`
             : `translate3d(${x.toFixed(3)}%,0,0)`;
-        put(v, "transform", transformStr);
+
+        if (still) {
+          put(still, "zIndex", String(i + 1));
+          put(still, "opacity", opacity.toFixed(3));
+          put(still, "visibility", "visible");
+          put(still, "objectPosition", objPos);
+          put(still, "transformOrigin", originStr);
+          put(still, "transform", transformStr);
+        }
+
+        if (v) {
+          if (useVideo) {
+            put(v, "zIndex", String(i + 10));
+            put(v, "opacity", opacity.toFixed(3));
+            put(v, "visibility", "visible");
+            put(v, "objectPosition", objPos);
+            put(v, "transformOrigin", originStr);
+            put(v, "transform", transformStr);
+          } else {
+            put(v, "visibility", "hidden");
+          }
+        }
       }
 
       for (const clip of CLIPS) {
         if (!used[clip.file]) {
           put(videoRefs.current[clip.file], "visibility", "hidden");
+          put(stillRefs.current[clip.file], "visibility", "hidden");
         }
       }
 
@@ -504,17 +581,6 @@ export default function App() {
       );
     };
 
-    let lenis: Lenis | null = null;
-    if (!calm) {
-      lenis = new Lenis({
-        lerp: 0.11,
-        wheelMultiplier: 1.05,
-        syncTouch: false,
-        anchors: true,
-      });
-      lenisRef.current = lenis;
-    }
-
     let rafId = 0;
     const loop = (now: number) => {
       if (lenis) lenis.raf(now);
@@ -526,36 +592,41 @@ export default function App() {
     frame(performance.now());
     rafId = requestAnimationFrame(loop);
 
-    let resizeTimer: ReturnType<typeof setTimeout> | undefined;
     const onResize = () => {
-      clearTimeout(resizeTimer);
-      resizeTimer = setTimeout(measure, 120);
+      measure();
     };
+    const ro = new ResizeObserver(measure);
+    ro.observe(document.documentElement);
 
-    window.addEventListener("resize", onResize);
+    window.addEventListener("resize", onResize, { passive: true });
     window.addEventListener("load", measure);
     if (document.fonts && document.fonts.ready) {
       document.fonts.ready.then(measure);
     }
 
     const unlockedFiles: Record<string, boolean> = {};
+    let unlockedCount = 0;
     const unlockTouchSeek = () => {
       for (const clip of CLIPS) {
         const v = videoRefs.current[clip.file];
         if (v && v.src && !unlockedFiles[clip.file]) {
           unlockedFiles[clip.file] = true;
+          unlockedCount++;
           v.play()
             .then(() => {
               v.pause();
             })
             .catch(() => {
               unlockedFiles[clip.file] = false;
+              unlockedCount--;
             });
         }
       }
+      if (unlockedCount >= CLIPS.length) {
+        window.removeEventListener("touchstart", unlockTouchSeek);
+      }
     };
     window.addEventListener("touchstart", unlockTouchSeek, {
-      once: !isDesktopForcedRef.current,
       passive: true,
     });
     if (isDesktopForcedRef.current) {
@@ -745,8 +816,8 @@ export default function App() {
 
     return () => {
       cancelAnimationFrame(rafId);
-      window.clearInterval(prefetchTimer);
-      clearTimeout(resizeTimer);
+      window.clearTimeout(prefetchFallbackRef.current);
+      ro.disconnect();
       window.removeEventListener("resize", onResize);
       window.removeEventListener("load", measure);
       window.removeEventListener("touchstart", unlockTouchSeek);
@@ -757,14 +828,17 @@ export default function App() {
         lenisRef.current = null;
       }
     };
-  }, [fetchFile, handleNavigate]);
+  }, [fetchFile, handleNavigate, pumpPrefetchQueue]);
 
   return (
     <>
       <FilmBackdrop
+        stillRefs={stillRefs}
         videoRefs={videoRefs}
         progressBarRef={progressBarRef}
         onVideoMetadata={handleVideoMetadata}
+        onVideoReady={handleVideoReady}
+        onVideoSeeked={handleVideoSeeked}
       />
 
       <Navbar onNavigate={handleNavigate} />
